@@ -1,0 +1,504 @@
+#!/usr/bin/env bash
+# ============================================================
+#  rs-cli — Realtor Studio Server Backup & Restore CLI
+#  Runs on: Mac Mini
+#  Usage:
+#    rs-cli backup
+#    rs-cli restore dest-[server_url]
+#    rs-cli status
+#    rs-cli list
+#    rs-cli config
+# ============================================================
+
+set -euo pipefail
+
+# ── Colors ──────────────────────────────────────────────────
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
+
+log()     { echo -e "${GREEN}[✔]${NC} $1"; }
+warn()    { echo -e "${YELLOW}[!]${NC} $1"; }
+error()   { echo -e "${RED}[✘]${NC} $1"; exit 1; }
+info()    { echo -e "${BLUE}[i]${NC} $1"; }
+header()  { echo -e "\n${BOLD}${CYAN}══════════════════════════════════════${NC}"; echo -e "${BOLD}${CYAN}  $1${NC}"; echo -e "${BOLD}${CYAN}══════════════════════════════════════${NC}\n"; }
+
+# ── Config ──────────────────────────────────────────────────
+CONFIG_DIR="$HOME/.rs-cli"
+CONFIG_FILE="$CONFIG_DIR/config.yaml"
+LOG_FILE="$CONFIG_DIR/rs-cli.log"
+TIMESTAMP=$(date +"%Y-%m-%d_%H-%M-%S")
+
+# ── Load config ─────────────────────────────────────────────
+load_config() {
+  [[ ! -f "$CONFIG_FILE" ]] && error "Config not found. Run: rs-cli config"
+
+  # Parse YAML values (simple key: value format)
+  get_val() { grep "^$1:" "$CONFIG_FILE" | sed 's/^[^:]*: *//' | tr -d '"' | tr -d "'"; }
+
+  SSH_HOST=$(get_val "ssh_host")
+  SSH_USER=$(get_val "ssh_user")
+  SSH_PORT=$(get_val "ssh_port")
+  SSH_KEY=$(get_val "ssh_key")
+  LOCAL_BACKUP_ROOT=$(get_val "local_backup_root")
+  CPANEL_USER=$(get_val "cpanel_user")
+  REMOTE_AGENT_PATH=$(get_val "remote_agent_path")
+  RETENTION_DAILY=$(get_val "retention_daily")
+  RETENTION_WEEKLY=$(get_val "retention_weekly")
+  RETENTION_MONTHLY=$(get_val "retention_monthly")
+  RETENTION_YEARLY=$(get_val "retention_yearly")
+
+  # Expand ~ in paths
+  LOCAL_BACKUP_ROOT="${LOCAL_BACKUP_ROOT/#\~/$HOME}"
+  SSH_KEY="${SSH_KEY/#\~/$HOME}"
+}
+
+# ── SSH Helper ───────────────────────────────────────────────
+ssh_cmd() {
+  ssh -i "$SSH_KEY" -p "$SSH_PORT" -o StrictHostKeyChecking=no \
+      -o BatchMode=yes "$SSH_USER@$SSH_HOST" "$@"
+}
+
+scp_get() {
+  scp -i "$SSH_KEY" -P "$SSH_PORT" -o StrictHostKeyChecking=no \
+      -r "$SSH_USER@$SSH_HOST:$1" "$2"
+}
+
+# ── Logging ─────────────────────────────────────────────────
+log_entry() {
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"
+}
+
+# ── Backup tier detection ────────────────────────────────────
+get_backup_tier() {
+  local DOW=$(date +%u)   # 1=Mon 7=Sun
+  local DOM=$(date +%d)   # day of month
+  local MOY=$(date +%m)   # month of year
+
+  if [[ "$MOY" == "01" && "$DOM" == "01" ]]; then echo "yearly"
+  elif [[ "$DOM" == "01" ]]; then echo "monthly"
+  elif [[ "$DOW" == "7" ]]; then echo "weekly"
+  else echo "daily"
+  fi
+}
+
+# ── cmd: config ─────────────────────────────────────────────
+cmd_config() {
+  header "rs-cli Configuration Setup"
+
+  mkdir -p "$CONFIG_DIR"
+
+  # Interactive setup
+  read -rp "VPS SSH host (e.g. 209.74.88.248): " IN_HOST
+  read -rp "SSH user [root]: " IN_USER;        IN_USER=${IN_USER:-root}
+  read -rp "SSH port [22]: " IN_PORT;          IN_PORT=${IN_PORT:-22}
+  read -rp "SSH key path [~/.ssh/id_ed25519]: " IN_KEY; IN_KEY=${IN_KEY:-~/.ssh/id_ed25519}
+  read -rp "cPanel username [realtorstudio]: " IN_CPANEL; IN_CPANEL=${IN_CPANEL:-realtorstudio}
+  read -rp "Local backup root [~/server-backups/realtorstudio.io_vps_namecheap]: " IN_LOCAL
+  IN_LOCAL=${IN_LOCAL:-~/server-backups/realtorstudio.io_vps_namecheap}
+  read -rp "Remote agent path [/root/rs-backup-agent.sh]: " IN_AGENT
+  IN_AGENT=${IN_AGENT:-/root/rs-backup-agent.sh}
+
+  cat > "$CONFIG_FILE" <<EOF
+# rs-cli Configuration
+# Managed by rs-cli config — edit carefully
+
+ssh_host: "$IN_HOST"
+ssh_user: "$IN_USER"
+ssh_port: "$IN_PORT"
+ssh_key: "$IN_KEY"
+cpanel_user: "$IN_CPANEL"
+local_backup_root: "$IN_LOCAL"
+remote_agent_path: "$IN_AGENT"
+
+# Retention (number of backups to keep per tier)
+retention_daily: 14
+retention_weekly: 8
+retention_monthly: 3
+retention_yearly: 2
+EOF
+
+  log "Config saved to $CONFIG_FILE"
+
+  # Sync config to VPS
+  echo ""
+  read -rp "Sync config to VPS now? (y/N): " SYNC
+  if [[ "$SYNC" =~ ^[Yy]$ ]]; then
+    load_config
+    ssh_cmd "mkdir -p /root/.rs-cli"
+    scp -i "$SSH_KEY" -P "$SSH_PORT" "$CONFIG_FILE" "$SSH_USER@$SSH_HOST:/root/.rs-cli/config.yaml"
+    log "Config synced to VPS at /root/.rs-cli/config.yaml"
+  fi
+}
+
+# ── cmd: backup ─────────────────────────────────────────────
+cmd_backup() {
+  load_config
+  header "rs-cli Backup — $(date '+%Y-%m-%d %H:%M:%S')"
+
+  TIER=$(get_backup_tier)
+  BACKUP_DIR="$LOCAL_BACKUP_ROOT/$TIER/$TIMESTAMP"
+  mkdir -p "$BACKUP_DIR"
+
+  info "Backup tier: $TIER"
+  info "Destination: $BACKUP_DIR"
+  echo ""
+
+  # ── Phase 1: Trigger remote agent ───────────────────────
+  info "Phase 1/4 — Triggering remote backup agent on VPS..."
+  log_entry "BACKUP START [$TIER] $TIMESTAMP"
+
+  ssh_cmd "bash $REMOTE_AGENT_PATH --backup" || error "Remote agent failed. Check VPS logs at /var/log/rs-backup-agent.log"
+  log "Remote backup agent completed"
+
+  # ── Phase 2: rsync /home ─────────────────────────────────
+  info "Phase 2/4 — Syncing /home/$CPANEL_USER via rsync..."
+  mkdir -p "$BACKUP_DIR/home"
+
+  rsync -avz --progress \
+    --exclude="tmp/*" \
+    --exclude="*.sock" \
+    --exclude=".cpanel/logs/*" \
+    -e "ssh -i $SSH_KEY -p $SSH_PORT -o StrictHostKeyChecking=no" \
+    "$SSH_USER@$SSH_HOST:/home/$CPANEL_USER/" \
+    "$BACKUP_DIR/home/" 2>&1 | tee -a "$LOG_FILE" | grep -E "sent|received|total|error|^>" || true
+
+  log "rsync complete"
+
+  # ── Phase 3: Pull cPanel backup ──────────────────────────
+  info "Phase 3/4 — Pulling cPanel backup archive..."
+  mkdir -p "$BACKUP_DIR/cpanel"
+
+  LATEST_CPANEL=$(ssh_cmd "ls -t /home/$CPANEL_USER/backup-*.tar.gz 2>/dev/null | head -1")
+
+  if [[ -n "$LATEST_CPANEL" ]]; then
+    scp_get "$LATEST_CPANEL" "$BACKUP_DIR/cpanel/"
+    log "cPanel backup pulled: $(basename $LATEST_CPANEL)"
+  else
+    warn "No cPanel backup archive found on VPS"
+  fi
+
+  # ── Phase 4: Pull MySQL dumps ────────────────────────────
+  info "Phase 4/4 — Pulling MySQL dumps..."
+  mkdir -p "$BACKUP_DIR/mysql"
+
+  scp_get "/root/.rs-cli/mysql_dumps/" "$BACKUP_DIR/mysql/" 2>/dev/null || warn "No MySQL dumps found"
+  log "MySQL dumps pulled"
+
+  # ── Write manifest ───────────────────────────────────────
+  cat > "$BACKUP_DIR/MANIFEST.txt" <<EOF
+rs-cli Backup Manifest
+======================
+Timestamp:  $TIMESTAMP
+Tier:       $TIER
+Source:     $SSH_USER@$SSH_HOST
+cPanel User: $CPANEL_USER
+
+Contents:
+  home/     — rsync of /home/$CPANEL_USER
+  cpanel/   — cPanel full backup archive
+  mysql/    — mysqldump of all databases
+
+Generated: $(date)
+EOF
+
+  log "Manifest written"
+
+  # ── Enforce retention ────────────────────────────────────
+  enforce_retention "$TIER"
+
+  # ── Summary ──────────────────────────────────────────────
+  BACKUP_SIZE=$(du -sh "$BACKUP_DIR" | cut -f1)
+  echo ""
+  log_entry "BACKUP COMPLETE [$TIER] $TIMESTAMP — Size: $BACKUP_SIZE"
+
+  echo -e "${GREEN}${BOLD}"
+  echo "  ╔══════════════════════════════════════╗"
+  echo "  ║         BACKUP COMPLETE              ║"
+  echo "  ╠══════════════════════════════════════╣"
+  echo "  ║  Tier:      $TIER"
+  echo "  ║  Size:      $BACKUP_SIZE"
+  echo "  ║  Location:  $BACKUP_DIR"
+  echo "  ╚══════════════════════════════════════╝"
+  echo -e "${NC}"
+}
+
+# ── Retention enforcement ────────────────────────────────────
+enforce_retention() {
+  local TIER=$1
+  local KEEP
+
+  case $TIER in
+    daily)   KEEP=$RETENTION_DAILY ;;
+    weekly)  KEEP=$RETENTION_WEEKLY ;;
+    monthly) KEEP=$RETENTION_MONTHLY ;;
+    yearly)  KEEP=$RETENTION_YEARLY ;;
+  esac
+
+  local TIER_DIR="$LOCAL_BACKUP_ROOT/$TIER"
+  local COUNT=$(ls -1 "$TIER_DIR" 2>/dev/null | wc -l)
+
+  if [[ $COUNT -gt $KEEP ]]; then
+    info "Pruning $TIER backups — keeping $KEEP of $COUNT..."
+    ls -1t "$TIER_DIR" | tail -n +$((KEEP + 1)) | while read OLD; do
+      warn "Removing old backup: $OLD"
+      rm -rf "$TIER_DIR/$OLD"
+      log_entry "PRUNED [$TIER] $OLD"
+    done
+  fi
+}
+
+# ── cmd: restore ────────────────────────────────────────────
+cmd_restore() {
+  load_config
+  local TARGET_HOST="${1:-}"
+  TARGET_HOST="${TARGET_HOST#dest-}"   # strip "dest-" prefix
+  [[ -z "$TARGET_HOST" ]] && TARGET_HOST="$SSH_HOST"
+
+  header "rs-cli Restore — Target: $TARGET_HOST"
+
+  # Pick backup to restore from
+  echo "Available backups (most recent first):"
+  echo ""
+  local i=1
+  declare -a BACKUP_PATHS
+  while IFS= read -r -d '' dir; do
+    local SIZE=$(du -sh "$dir" | cut -f1)
+    local TIER=$(basename $(dirname "$dir"))
+    printf "  ${CYAN}%2d${NC}) [%-7s] %s  (%s)\n" $i "$TIER" "$(basename $dir)" "$SIZE"
+    BACKUP_PATHS[$i]="$dir"
+    ((i++))
+  done < <(find "$LOCAL_BACKUP_ROOT" -mindepth 2 -maxdepth 2 -type d -print0 | sort -rz)
+
+  echo ""
+  read -rp "Select backup to restore [1]: " SEL; SEL=${SEL:-1}
+  SELECTED="${BACKUP_PATHS[$SEL]}"
+  [[ -z "$SELECTED" ]] && error "Invalid selection"
+
+  info "Selected: $SELECTED"
+  echo ""
+
+  # ── Diff report ─────────────────────────────────────────
+  header "Generating Diff Report"
+  info "Comparing backup to live server..."
+
+  DIFF_REPORT="$CONFIG_DIR/restore-diff-$TIMESTAMP.txt"
+
+  cat > "$DIFF_REPORT" <<EOF
+rs-cli Restore Diff Report
+===========================
+Backup:  $SELECTED
+Target:  $TARGET_HOST
+Date:    $(date)
+
+FILE DIFFERENCES (backup vs live server)
+-----------------------------------------
+EOF
+
+  # rsync dry-run diff
+  rsync -avzn --delete \
+    --exclude="tmp/*" \
+    --exclude="*.sock" \
+    -e "ssh -i $SSH_KEY -p $SSH_PORT -o StrictHostKeyChecking=no" \
+    "$SELECTED/home/" \
+    "$SSH_USER@$TARGET_HOST:/home/$CPANEL_USER/" \
+    2>&1 >> "$DIFF_REPORT" || true
+
+  echo "" >> "$DIFF_REPORT"
+  echo "END OF DIFF REPORT" >> "$DIFF_REPORT"
+
+  # Show summary
+  ADDED=$(grep "^>" "$DIFF_REPORT" 2>/dev/null | wc -l || echo 0)
+  DELETED=$(grep "^deleting" "$DIFF_REPORT" 2>/dev/null | wc -l || echo 0)
+
+  echo ""
+  echo -e "${BOLD}Diff Summary:${NC}"
+  echo -e "  Files to restore/update: ${YELLOW}$ADDED${NC}"
+  echo -e "  Files to delete on server: ${RED}$DELETED${NC}"
+  echo -e "  Full report: ${CYAN}$DIFF_REPORT${NC}"
+  echo ""
+
+  # Open report
+  read -rp "Open full diff report? (y/N): " OPEN_REPORT
+  [[ "$OPEN_REPORT" =~ ^[Yy]$ ]] && open "$DIFF_REPORT" 2>/dev/null || cat "$DIFF_REPORT"
+
+  # ── Confirmation ─────────────────────────────────────────
+  echo ""
+  warn "This will overwrite live data on $TARGET_HOST"
+  warn "A pre-restore backup will be taken first automatically"
+  echo ""
+  read -rp "Type 'RESTORE' to confirm: " CONFIRM
+  [[ "$CONFIRM" != "RESTORE" ]] && { info "Restore cancelled."; exit 0; }
+
+  # ── Pre-restore safety backup ────────────────────────────
+  header "Taking Pre-Restore Safety Backup"
+  info "Backing up current live state before restore..."
+  PRE_RESTORE_DIR="$LOCAL_BACKUP_ROOT/pre-restore/$TIMESTAMP"
+  mkdir -p "$PRE_RESTORE_DIR"
+
+  rsync -avz --progress \
+    --exclude="tmp/*" \
+    -e "ssh -i $SSH_KEY -p $SSH_PORT -o StrictHostKeyChecking=no" \
+    "$SSH_USER@$TARGET_HOST:/home/$CPANEL_USER/" \
+    "$PRE_RESTORE_DIR/" 2>&1 | tail -5
+  log "Pre-restore backup saved to $PRE_RESTORE_DIR"
+
+  # ── Restore files ────────────────────────────────────────
+  header "Restoring Files"
+  info "Pushing files to $TARGET_HOST..."
+
+  rsync -avz --delete --progress \
+    --exclude="tmp/*" \
+    --exclude="*.sock" \
+    -e "ssh -i $SSH_KEY -p $SSH_PORT -o StrictHostKeyChecking=no" \
+    "$SELECTED/home/" \
+    "$SSH_USER@$TARGET_HOST:/home/$CPANEL_USER/" 2>&1 | tee -a "$LOG_FILE" | tail -10
+
+  log "Files restored"
+
+  # ── Restore databases ────────────────────────────────────
+  if [[ -d "$SELECTED/mysql" ]]; then
+    header "Restoring Databases"
+    info "Importing MySQL dumps..."
+
+    for DUMP in "$SELECTED/mysql/"*.sql.gz; do
+      [[ -f "$DUMP" ]] || continue
+      DB=$(basename "$DUMP" .sql.gz)
+      info "Restoring database: $DB"
+      scp_get "$DUMP" "/tmp/${DB}.sql.gz" 2>/dev/null || true
+      ssh_cmd "gunzip -c /tmp/${DB}.sql.gz | mysql $DB 2>/dev/null && rm /tmp/${DB}.sql.gz" || warn "Could not restore $DB — may need manual import"
+    done
+  fi
+
+  log_entry "RESTORE COMPLETE — From: $SELECTED To: $TARGET_HOST"
+
+  echo ""
+  echo -e "${GREEN}${BOLD}"
+  echo "  ╔══════════════════════════════════════╗"
+  echo "  ║         RESTORE COMPLETE             ║"
+  echo "  ╠══════════════════════════════════════╣"
+  echo "  ║  Source:  $(basename $SELECTED)"
+  echo "  ║  Target:  $TARGET_HOST"
+  echo "  ║  Safety:  $PRE_RESTORE_DIR"
+  echo "  ╚══════════════════════════════════════╝"
+  echo -e "${NC}"
+}
+
+# ── cmd: list ───────────────────────────────────────────────
+cmd_list() {
+  load_config
+  header "Available Backups"
+
+  for TIER in yearly monthly weekly daily pre-restore; do
+    TIER_DIR="$LOCAL_BACKUP_ROOT/$TIER"
+    [[ -d "$TIER_DIR" ]] || continue
+    echo -e "${BOLD}${CYAN}[$TIER]${NC}"
+    ls -1t "$TIER_DIR" 2>/dev/null | while read B; do
+      SIZE=$(du -sh "$TIER_DIR/$B" 2>/dev/null | cut -f1)
+      echo -e "  ${B}  ${YELLOW}(${SIZE})${NC}"
+    done
+    echo ""
+  done
+}
+
+# ── cmd: status ─────────────────────────────────────────────
+cmd_status() {
+  load_config
+  header "rs-cli Status"
+
+  # Last backup
+  LAST=$(find "$LOCAL_BACKUP_ROOT" -mindepth 2 -maxdepth 2 -type d 2>/dev/null | sort | tail -1)
+  if [[ -n "$LAST" ]]; then
+    LAST_SIZE=$(du -sh "$LAST" | cut -f1)
+    log "Last backup: $(basename $LAST) (${LAST_SIZE})"
+  else
+    warn "No backups found"
+  fi
+
+  # Disk usage
+  TOTAL=$(du -sh "$LOCAL_BACKUP_ROOT" 2>/dev/null | cut -f1)
+  info "Total backup storage used: $TOTAL"
+
+  # Count per tier
+  for TIER in yearly monthly weekly daily; do
+    COUNT=$(ls -1 "$LOCAL_BACKUP_ROOT/$TIER" 2>/dev/null | wc -l)
+    info "$TIER backups: $COUNT"
+  done
+
+  # VPS connectivity
+  echo ""
+  info "Testing VPS connection..."
+  ssh_cmd "echo 'VPS OK'" && log "VPS reachable at $SSH_HOST" || warn "Cannot reach VPS"
+
+  # Last 5 log entries
+  echo ""
+  info "Recent activity:"
+  tail -5 "$LOG_FILE" 2>/dev/null | while read LINE; do
+    echo "  $LINE"
+  done
+}
+
+# ── cmd: cron ───────────────────────────────────────────────
+cmd_cron() {
+  load_config
+  header "Install Cron Schedule"
+
+  SCRIPT_PATH=$(realpath "$0")
+
+  echo "This will add the following cron jobs to your Mac Mini:"
+  echo ""
+  echo -e "  ${CYAN}Every 12 hours:${NC}  0 */12 * * * $SCRIPT_PATH backup"
+  echo ""
+  read -rp "Install cron jobs? (y/N): " CONFIRM
+  [[ ! "$CONFIRM" =~ ^[Yy]$ ]] && { info "Cron install cancelled."; exit 0; }
+
+  # Remove existing rs-cli cron entries
+  crontab -l 2>/dev/null | grep -v "rs-cli" > /tmp/rs-cron || true
+
+  # Add new entries
+  cat >> /tmp/rs-cron <<EOF
+
+# rs-cli automated backups
+0 */12 * * * $SCRIPT_PATH backup >> $LOG_FILE 2>&1
+EOF
+
+  crontab /tmp/rs-cron
+  rm /tmp/rs-cron
+
+  log "Cron jobs installed"
+  info "Run 'crontab -l' to verify"
+}
+
+# ── Help ─────────────────────────────────────────────────────
+cmd_help() {
+  echo ""
+  echo -e "${BOLD}${CYAN}rs-cli — Realtor Studio Server Backup & Restore${NC}"
+  echo ""
+  echo -e "${BOLD}Usage:${NC}"
+  echo "  rs-cli backup                    Run a backup now"
+  echo "  rs-cli restore dest-[host]       Restore to a server"
+  echo "  rs-cli list                      List all backups"
+  echo "  rs-cli status                    Show status & storage"
+  echo "  rs-cli cron                      Install cron schedule"
+  echo "  rs-cli config                    Configure settings"
+  echo ""
+  echo -e "${BOLD}Examples:${NC}"
+  echo "  rs-cli backup"
+  echo "  rs-cli restore dest-209.74.88.248"
+  echo "  rs-cli restore dest-server1.realtorstudio.io"
+  echo ""
+}
+
+# ── Entry point ──────────────────────────────────────────────
+CMD="${1:-help}"
+shift || true
+
+case "$CMD" in
+  backup)   cmd_backup "$@" ;;
+  restore)  cmd_restore "$@" ;;
+  list)     cmd_list ;;
+  status)   cmd_status ;;
+  cron)     cmd_cron ;;
+  config)   cmd_config ;;
+  help|--help|-h) cmd_help ;;
+  *) error "Unknown command: $CMD. Run 'rs-cli help'" ;;
+esac

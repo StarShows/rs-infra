@@ -39,6 +39,9 @@ load_config() {
   SSH_USER=$(get_val "ssh_user")
   SSH_PORT=$(get_val "ssh_port")
   SSH_KEY=$(get_val "ssh_key")
+  SSH_KEY_BACKUP=$(get_val "ssh_key_backup")
+  SSH_PORT_BACKUP=$(get_val "ssh_port_backup")
+  SSH_KEY_BACKUP="${SSH_KEY_BACKUP/#\~/$HOME}"
   LOCAL_BACKUP_ROOT=$(get_val "local_backup_root")
   CPANEL_USER=$(get_val "cpanel_user")
   REMOTE_AGENT_PATH=$(get_val "remote_agent_path")
@@ -54,18 +57,47 @@ load_config() {
 
 # ── SSH Helper ───────────────────────────────────────────────
 ssh_cmd() {
-  ssh -i "$SSH_KEY" -p "$SSH_PORT" -o StrictHostKeyChecking=no \
+  ssh -i "$SSH_KEY_BACKUP" -p "$SSH_PORT_BACKUP" -o StrictHostKeyChecking=no \
       -o BatchMode=yes "$SSH_USER@$SSH_HOST" "$@"
 }
 
 scp_get() {
-  scp -i "$SSH_KEY" -P "$SSH_PORT" -o StrictHostKeyChecking=no \
+  scp -i "$SSH_KEY_BACKUP" -P "$SSH_PORT_BACKUP" -o StrictHostKeyChecking=no \
       -r "$SSH_USER@$SSH_HOST:$1" "$2"
 }
 
 # ── Logging ─────────────────────────────────────────────────
 log_entry() {
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"
+}
+
+# Cleanup stale temp files from previous interrupted runs
+cleanup_temp() {
+  local PARTIAL_DIR="$CONFIG_DIR/.rsync-partial"
+  local PARTIAL_RESTORE_DIR="$CONFIG_DIR/.rsync-partial-restore"
+
+  if [[ -d "$PARTIAL_DIR" ]]; then
+    find "$PARTIAL_DIR" -type f -mmin +60 -delete 2>/dev/null || true
+    find "$PARTIAL_DIR" -type d -empty -delete 2>/dev/null || true
+    echo -e "\033[0;34m[i]\033[0m Cleaned stale rsync temp files"
+  fi
+
+  if [[ -d "$PARTIAL_RESTORE_DIR" ]]; then
+    find "$PARTIAL_RESTORE_DIR" -type f -mmin +60 -delete 2>/dev/null || true
+    find "$PARTIAL_RESTORE_DIR" -type d -empty -delete 2>/dev/null || true
+  fi
+
+  if [[ -d "$LOCAL_BACKUP_ROOT" ]]; then
+    find "$LOCAL_BACKUP_ROOT" -mindepth 2 -maxdepth 2 -type d | while read DIR; do
+      if [[ ! -f "$DIR/MANIFEST.txt" ]]; then
+        AGE_MINS=$(( ($(date +%s) - $(stat -f%m "$DIR" 2>/dev/null || echo $(date +%s))) / 60 ))
+        if [[ $AGE_MINS -gt 60 ]]; then
+          echo -e "\033[1;33m[!]\033[0m Removing incomplete backup: $(basename $DIR)"
+          rm -rf "$DIR"
+        fi
+      fi
+    done
+  fi
 }
 
 # ── Backup tier detection ────────────────────────────────────
@@ -135,6 +167,7 @@ cmd_backup() {
   load_config
   header "rs-cli Backup — $(date '+%Y-%m-%d %H:%M:%S')"
 
+  cleanup_temp
   TIER=$(get_backup_tier)
   BACKUP_DIR="$LOCAL_BACKUP_ROOT/$TIER/$TIMESTAMP"
   mkdir -p "$BACKUP_DIR"
@@ -147,28 +180,67 @@ cmd_backup() {
   info "Phase 1/4 — Triggering remote backup agent on VPS..."
   log_entry "BACKUP START [$TIER] $TIMESTAMP"
 
-  ssh_cmd "bash $REMOTE_AGENT_PATH --backup" || error "Remote agent failed. Check VPS logs at /var/log/rs-backup-agent.log"
+  ssh_cmd "nice -n 19 ionice -c 3 bash $REMOTE_AGENT_PATH --backup" || error "Remote agent failed. Check VPS logs at /var/log/rs-backup-agent.log"
   log "Remote backup agent completed"
 
   # ── Phase 2: rsync /home ─────────────────────────────────
   info "Phase 2/4 — Syncing /home/$CPANEL_USER via rsync..."
   mkdir -p "$BACKUP_DIR/home"
 
-  rsync -avz --progress \
-    --exclude="tmp/*" \
-    --exclude="*.sock" \
-    --exclude=".cpanel/logs/*" \
-    -e "ssh -i $SSH_KEY -p $SSH_PORT -o StrictHostKeyChecking=no" \
-    "$SSH_USER@$SSH_HOST:/home/$CPANEL_USER/" \
-    "$BACKUP_DIR/home/" 2>&1 | tee -a "$LOG_FILE" | grep -E "sent|received|total|error|^>" || true
+  PARTIAL_DIR="$CONFIG_DIR/.rsync-partial"
+  mkdir -p "$PARTIAL_DIR"
 
+  rsync_with_resume() {
+    local ATTEMPT=1
+    local MAX_ATTEMPTS=5
+    local WAIT=10
+
+    while [[ $ATTEMPT -le $MAX_ATTEMPTS ]]; do
+      if [[ $ATTEMPT -gt 1 ]]; then
+        warn "Connection interrupted. Auto-resuming in ${WAIT}s... (attempt $ATTEMPT/$MAX_ATTEMPTS)"
+        sleep $WAIT
+        WAIT=$((WAIT * 2))
+        info "Resuming from where we left off..."
+      fi
+
+      nice -n 19 rsync -az \
+        --partial-dir="$PARTIAL_DIR" \
+        --timeout=60 \
+        --info=progress2 --stats \
+        --human-readable \
+        --bwlimit=50000 \
+        --exclude="tmp/*" \
+        --exclude="*.sock" \
+        --exclude=".cpanel/logs/*" \
+        --exclude="softaculous_backups/*" \
+        --exclude="cpmove-*.tar.gz" \
+        -e "ssh -i $SSH_KEY_BACKUP -p $SSH_PORT_BACKUP -o StrictHostKeyChecking=no -o ServerAliveInterval=15 -o ServerAliveCountMax=4" \
+        "$SSH_USER@$SSH_HOST:/home/$CPANEL_USER/" \
+        "$BACKUP_DIR/home/" | tee -a "$LOG_FILE" 2>&1 \
+        && { log "rsync complete ✔"; return 0; } \
+        || RSYNC_EXIT=$?
+
+      if [[ ${RSYNC_EXIT:-0} -eq 24 ]]; then
+        log "rsync complete (some files vanished mid-transfer — normal)"
+        return 0
+      fi
+
+      warn "rsync exited with code ${RSYNC_EXIT:-?}"
+      ATTEMPT=$((ATTEMPT + 1))
+    done
+
+    error "rsync failed after $MAX_ATTEMPTS attempts. Check log: $LOG_FILE"
+  }
+
+  rsync_with_resume
   log "rsync complete"
+
 
   # ── Phase 3: Pull cPanel backup ──────────────────────────
   info "Phase 3/4 — Pulling cPanel backup archive..."
   mkdir -p "$BACKUP_DIR/cpanel"
 
-  LATEST_CPANEL=$(ssh_cmd "ls -t /home/$CPANEL_USER/backup-*.tar.gz 2>/dev/null | head -1")
+  LATEST_CPANEL=$(ssh_cmd "ls -t /home/$CPANEL_USER/cpmove-*.tar.gz 2>/dev/null | head -1")
 
   if [[ -n "$LATEST_CPANEL" ]]; then
     scp_get "$LATEST_CPANEL" "$BACKUP_DIR/cpanel/"
@@ -250,6 +322,7 @@ enforce_retention() {
 # ── cmd: restore ────────────────────────────────────────────
 cmd_restore() {
   load_config
+  cleanup_temp
   local TARGET_HOST="${1:-}"
   TARGET_HOST="${TARGET_HOST#dest-}"   # strip "dest-" prefix
   [[ -z "$TARGET_HOST" ]] && TARGET_HOST="$SSH_HOST"
@@ -335,7 +408,7 @@ EOF
   PRE_RESTORE_DIR="$LOCAL_BACKUP_ROOT/pre-restore/$TIMESTAMP"
   mkdir -p "$PRE_RESTORE_DIR"
 
-  rsync -avz --progress \
+  rsync -avz --info=progress2 --stats \
     --exclude="tmp/*" \
     -e "ssh -i $SSH_KEY -p $SSH_PORT -o StrictHostKeyChecking=no" \
     "$SSH_USER@$TARGET_HOST:/home/$CPANEL_USER/" \
@@ -346,7 +419,7 @@ EOF
   header "Restoring Files"
   info "Pushing files to $TARGET_HOST..."
 
-  rsync -avz --delete --progress \
+  rsync -avz --delete --info=progress2 --stats \
     --exclude="tmp/*" \
     --exclude="*.sock" \
     -e "ssh -i $SSH_KEY -p $SSH_PORT -o StrictHostKeyChecking=no" \

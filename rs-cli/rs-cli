@@ -203,7 +203,7 @@ cmd_backup() {
         info "Resuming from where we left off..."
       fi
 
-      nice -n 19 rsync -az \
+      nice -n 19 /opt/homebrew/bin/rsync -az \
         --partial-dir="$PARTIAL_DIR" \
         --timeout=60 \
         --info=progress2 --stats \
